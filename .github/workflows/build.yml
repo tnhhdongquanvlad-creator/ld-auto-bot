@@ -3,7 +3,7 @@ name: Build exe
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, thu-nghiem ]
 
 permissions:
   contents: write
@@ -38,5 +38,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete latest --yes --cleanup-tag || true
-          gh release create latest LD_Auto_Bot.zip --target "$GITHUB_SHA" --title "LD Auto Bot - ban moi nhat" --notes "Giai nen, chep de LD_Auto_Bot.exe va thu muc _internal vao thu muc app cu. Giu nguyen templates, workflow.json, config.json."
+          if [ "$GITHUB_REF_NAME" = "main" ] || [ "$GITHUB_REF_NAME" = "master" ]; then
+            TAG=latest; EXTRA="--latest"; TITLE="LD Auto Bot - ban moi nhat"
+          else
+            TAG="$GITHUB_REF_NAME"; EXTRA="--prerelease"; TITLE="LD Auto Bot - ban thu nghiem ($GITHUB_REF_NAME)"
+          fi
+          gh release delete "$TAG" --yes --cleanup-tag || true
+          gh release create "$TAG" LD_Auto_Bot.zip --target "$GITHUB_SHA" --title "$TITLE" $EXTRA --notes "Giai nen, chep de LD_Auto_Bot.exe va thu muc _internal vao thu muc app cu. Giu nguyen templates, workflow.json, config.json."
