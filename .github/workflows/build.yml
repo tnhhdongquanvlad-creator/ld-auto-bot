@@ -5,6 +5,9 @@ on:
   push:
     branches: [ main, master ]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -26,3 +29,14 @@ jobs:
         with:
           name: LD_Auto_Bot
           path: dist/LD_Auto_Bot
+
+      - name: Zip exe
+        run: Compress-Archive -Path dist/LD_Auto_Bot -DestinationPath LD_Auto_Bot.zip
+
+      - name: Publish release (link tai co dinh, khong can dang nhap)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest LD_Auto_Bot.zip --target "$GITHUB_SHA" --title "LD Auto Bot - ban moi nhat" --notes "Giai nen, chep de LD_Auto_Bot.exe va thu muc _internal vao thu muc app cu. Giu nguyen templates, workflow.json, config.json."
