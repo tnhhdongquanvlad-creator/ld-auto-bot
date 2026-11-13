@@ -1,0 +1,28 @@
+name: Build exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build exe
+        run: python -m PyInstaller --noconfirm --clean --onedir --noconsole --uac-admin --name LD_Auto_Bot ld_bot.py
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: LD_Auto_Bot
+          path: dist/LD_Auto_Bot
