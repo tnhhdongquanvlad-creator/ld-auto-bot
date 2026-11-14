@@ -40,7 +40,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 WORKFLOW_FILE = os.path.join(APP_DIR, "workflow.json")          # Mục 1: danh sách chính
 WORKFLOW_QC_FILE = os.path.join(APP_DIR, "workflow_qc.json")    # Mục 2: xem quảng cáo (danh sách riêng)
 LIST_FILES = {1: WORKFLOW_FILE, 2: WORKFLOW_QC_FILE}
-LIST_NAMES = {1: "MỤC 1 (danh sách chính)", 2: "MỤC 2 (xem quảng cáo)"}
+LIST_NAMES = {1: "ĐIỂM DANH", 2: "XEM QC"}
 os.makedirs(TEMPLATE_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -76,7 +76,7 @@ DEFAULT_CONFIG = {
     "daily_enabled": False,   # mỗi ngày tự chạy lại từ đầu vào giờ hẹn
     "daily_hour": 6,
     "daily_minute": 0,
-    "chain_qc": False,        # xong Mục 1 thì tự chạy lại từ đầu với Mục 2 (xem quảng cáo)
+    "chain_qc": True,         # Điểm danh xong hết các tab thì quay lại tab đầu chạy Xem QC
 }
 
 # Hành động khi thấy ảnh (cột "Hành động" ở Bước 2)
@@ -1163,6 +1163,9 @@ class App(tk.Tk):
         if int(self.cfg.get("cfg_version", 1)) < 2:
             self.cfg["tab_timeout"] = 0   # từ bản này: tab chỉ tắt khi click được ảnh cuối
             self.cfg["cfg_version"] = 2
+        if int(self.cfg.get("cfg_version", 1)) < 3:
+            self.cfg["chain_qc"] = True   # từ bản này: mặc định Điểm danh hết các tab rồi chạy Xem QC
+            self.cfg["cfg_version"] = 3
         self.lists = {k: load_steps(p) for k, p in LIST_FILES.items()}   # 1: Mục 1, 2: Mục 2 (quảng cáo)
         self.cur = 1                    # danh sách đang hiện ở Bước 2
         self.steps = self.lists[1]
@@ -1178,8 +1181,8 @@ class App(tk.Tk):
         if not console_exe(self.cfg["ld_dir"]):
             self.cfg["ld_dir"] = find_ld_dir()
         self.build_ui()
-        for k in (2, 1):                # vẽ cả 2 danh sách, để Mục 1 đang chọn
-            self.select_list(k)
+        for k in (2, 1):                # vẽ cả 2 danh sách (Bước 3 Xem QC, Bước 2 Điểm danh)
+            self.select_list(k, switch_tab=False)
             self.refresh_tree()
         self.after(200, self.pump)
         self.after(1000, self.daily_tick)
@@ -1271,8 +1274,10 @@ class App(tk.Tk):
         self.nb = ttk.Notebook(self)   # pack ở cuối build_ui để nhật ký luôn có chỗ
         p1 = ttk.Frame(self.nb, padding=6)
         p2 = ttk.Frame(self.nb, padding=2)
+        p3 = ttk.Frame(self.nb, padding=2)
         self.nb.add(p1, text="  Bước 1: Quét & chọn tab LD  ")
-        self.nb.add(p2, text="  Bước 2: Cài đặt & ảnh cần click  ", state="disabled")
+        self.nb.add(p2, text="  Bước 2: ✅ Điểm danh  ", state="disabled")
+        self.nb.add(p3, text="  Bước 3: 📺 Xem QC  ", state="disabled")
 
         # ================= TRANG 1 =================
         f1 = ttk.LabelFrame(p1, text=" LDPlayer ", padding=6)
@@ -1319,29 +1324,29 @@ class App(tk.Tk):
         bt1.pack(fill="x")
         self.lbl_count = ttk.Label(bt1, text="Chưa quét. Bấm 'Quét tab trong LD'.")
         self.lbl_count.pack(side="left")
-        ttk.Button(bt1, text="Tiếp tục: Cài đặt & ảnh cần click  >>", command=self.go_setup,
+        ttk.Button(bt1, text="Tiếp tục: Bước 2 Điểm danh  >>", command=self.go_setup,
                    style="Accent.TButton").pack(side="right")
 
-        # ================= TRANG 2 =================
-        fi = ttk.LabelFrame(p2, text=" Danh sách ảnh cần click (theo thứ tự từ trên xuống) ", padding=6)
-        fi.pack(fill="both", expand=True, padx=4, pady=4)
-        hint = ttk.Frame(fi)
-        hint.pack(fill="x", pady=(0, 4))
-        ttk.Label(hint, foreground="#4338ca", justify="left", wraplength=560,
-                  text="Mỗi 'Chu kỳ quét' giây: chụp màn hình, thấy ảnh nào thì làm 'Hành động' của ảnh đó. "
-                       "Làm xong ảnh CUỐI CÙNG thì tab tắt. Đổi hành động: bấm đúp vào dòng ảnh."
-                  ).pack(side="left", anchor="w")
-        ttk.Checkbutton(hint, text="Xong Mục 1 thì tự chạy lại từ đầu\nvới Mục 2 (xem quảng cáo)",
-                        variable=var("chain_qc", "b")).pack(side="right")
-        body = ttk.Frame(fi)
-        body.pack(fill="both", expand=True)
-        self.lists_nb = ttk.Notebook(body)
-        self.lists_nb.pack(side="left", fill="both", expand=True)
+        # ================= TRANG 2 (Điểm danh) & TRANG 3 (Xem QC): mỗi trang 1 danh sách riêng =================
         self.trees = {}
-        for k, title in ((1, "  Mục 1: Danh sách chính  "), (2, "  Mục 2: 📺 Xem quảng cáo  ")):
-            pg = ttk.Frame(self.lists_nb, padding=(0, 4, 0, 0))
-            self.lists_nb.add(pg, text=title)
-            tr = ttk.Treeview(pg, columns=("n", "img", "act", "note"), show="headings", height=4)
+        self.btn_trys = []
+
+        def list_panel(page, k):
+            title = " ✅ Danh sách ảnh ĐIỂM DANH (theo thứ tự từ trên xuống) " if k == 1 else \
+                    " 📺 Danh sách ảnh XEM QC (theo thứ tự từ trên xuống) "
+            fi = ttk.LabelFrame(page, text=title, padding=6)
+            hint = ttk.Frame(fi)
+            hint.pack(fill="x", pady=(0, 4))
+            ttk.Label(hint, foreground="#4338ca", justify="left", wraplength=560,
+                      text="Mỗi 'Chu kỳ quét' giây: chụp màn hình, thấy ảnh nào thì làm 'Hành động' của ảnh đó. "
+                           "Làm xong ảnh CUỐI CÙNG thì tab tắt. Đổi hành động: bấm đúp vào dòng ảnh."
+                      ).pack(side="left", anchor="w")
+            if k == 2:
+                ttk.Checkbutton(hint, text="Xong Bước 2 (Điểm danh HẾT các tab)\nthì tự động sang Bước 3 (Xem QC)",
+                                variable=var("chain_qc", "b")).pack(side="right")
+            body = ttk.Frame(fi)
+            body.pack(fill="both", expand=True)
+            tr = ttk.Treeview(body, columns=("n", "img", "act", "note"), show="headings", height=4)
             for c, t, w in (("n", "#", 32), ("img", "Ảnh mẫu", 150), ("act", "Hành động", 330), ("note", "Ghi chú", 130)):
                 tr.heading(c, text=t)
                 tr.column(c, width=w, minwidth=30, anchor="w", stretch=(c == "act"))
@@ -1353,22 +1358,42 @@ class App(tk.Tk):
             tr.tag_configure("must", background="#dbeafe", foreground="#1e40af")
             tr.bind("<Double-1>", lambda e: self.edit_action())
             self.trees[k] = tr
-        self.tree = self.trees[1]
-        self.lists_nb.bind("<<NotebookTabChanged>>",
-                           lambda e: self.select_list(self.lists_nb.index("current") + 1, switch_tab=False))
-        bf = ttk.Frame(body)
-        bf.pack(side="left", fill="y", padx=(6, 0), pady=(24, 0))
-        for text, cmd, r, c in (("Chụp ảnh mới", self.capture_new, 0, 0), ("Chọn ảnh có sẵn", self.add_existing, 0, 1),
-                                ("▲ Lên", lambda: self.move_step(-1), 1, 0), ("▼ Xuống", lambda: self.move_step(1), 1, 1),
-                                ("Xóa", self.del_step, 2, 0), ("Hành động...", self.edit_action, 2, 1)):
-            ttk.Button(bf, text=text, command=cmd, width=15,
-                       style="Accent.TButton" if text == "Chụp ảnh mới" else "TButton").grid(
-                row=r, column=c, padx=2, pady=2, sticky="ew")
-        for text, cmd, r, c in (("➕ Không ảnh", self.add_noimg, 3, 0), ("Bỏ gói", self.unpack, 3, 1),
-                                ("📦 Gói lặp...", self.make_pack, 4, 0), ("🔒 Gói bắt buộc", self.make_must, 4, 1)):
-            ttk.Button(bf, text=text, command=cmd, width=15).grid(row=r, column=c, padx=2, pady=2, sticky="ew")
+            bf = ttk.Frame(body)
+            bf.pack(side="left", fill="y", padx=(6, 0))
+            btns = [("Chụp ảnh mới", self.capture_new), ("Chọn ảnh có sẵn", self.add_existing),
+                    ("▲ Lên", lambda: self.move_step(-1)), ("▼ Xuống", lambda: self.move_step(1)),
+                    ("Xóa", self.del_step), ("Hành động...", self.edit_action)]
+            if k == 2:
+                btns.append(("➕ Không ảnh", self.add_noimg))
+            btns += [("Bỏ gói", self.unpack), ("📦 Gói lặp...", self.make_pack), ("🔒 Gói bắt buộc", self.make_must)]
+            if len(btns) % 2:
+                btns.insert(len(btns) - 3, None)   # giữ 'Bỏ gói' và 2 nút gói thẳng hàng
+            for pos, b in enumerate(btns):
+                if b:
+                    ttk.Button(bf, text=b[0], command=b[1], width=15,
+                               style="Accent.TButton" if b[0] == "Chụp ảnh mới" else "TButton").grid(
+                        row=pos // 2, column=pos % 2, padx=2, pady=2, sticky="ew")
+            return fi
 
-        fs = ttk.LabelFrame(p2, text=" Cài đặt (đơn vị: giây) ", padding=6)
+        def test_panel(page):
+            f4 = ttk.LabelFrame(page, text=" Tab thử nghiệm (để chụp ảnh mẫu & chạy thử danh sách trang này) ", padding=6)
+            ttk.Label(f4, text="Tab số:").pack(side="left")
+            ttk.Spinbox(f4, from_=1, to=9999, textvariable=self.vars["test_tab"], width=6).pack(side="left", padx=4)
+            ttk.Button(f4, text="Mở tab test", command=self.open_test).pack(side="left", padx=4)
+            ttk.Button(f4, text="Tắt tab test", command=self.close_test).pack(side="left", padx=4)
+            ttk.Button(f4, text="Chụp ảnh mẫu", command=lambda: self.open_picker(lambda k, d: None)).pack(side="left", padx=4)
+            b = ttk.Button(f4, text="▶ Chạy thử trên tab này", command=self.run_test, style="Accent.TButton")
+            b.pack(side="left", padx=4)
+            self.btn_trys.append(b)
+            return f4
+
+        var("test_tab", "i")
+        fi = list_panel(p2, 1)
+        fi3 = list_panel(p3, 2)
+        self.tree = self.trees[1]
+        self.nb.bind("<<NotebookTabChanged>>", lambda e: self.on_page_change())
+
+        fs = ttk.LabelFrame(p2, text=" Cài đặt (đơn vị: giây, dùng chung cho Điểm danh và Xem QC) ", padding=6)
         fs.pack(fill="x", padx=4, pady=4)
 
         def sp(label, key, kind, frm, to, r, c, inc=1, w=8):
@@ -1399,27 +1424,22 @@ class App(tk.Tk):
             ttk.Label(rf, text=lab).pack(side="left", padx=(4, 2))
             ttk.Spinbox(rf, from_=80, to=3000, textvariable=var(key, "i"), width=6).pack(side="left")
 
-        f4 = ttk.LabelFrame(p2, text=" Tab thử nghiệm (để chụp ảnh mẫu & chạy thử) ", padding=6)
-        f4.pack(fill="x", padx=4, pady=4)
-        ttk.Label(f4, text="Tab số:").pack(side="left")
-        ttk.Spinbox(f4, from_=1, to=9999, textvariable=var("test_tab", "i"), width=6).pack(side="left", padx=4)
-        ttk.Button(f4, text="Mở tab test", command=self.open_test).pack(side="left", padx=4)
-        ttk.Button(f4, text="Tắt tab test", command=self.close_test).pack(side="left", padx=4)
-        ttk.Button(f4, text="Chụp ảnh mẫu", command=lambda: self.open_picker(lambda k, d: None)).pack(side="left", padx=4)
-        self.btn_try = ttk.Button(f4, text="▶ Chạy thử trên tab này", command=self.run_test, style="Accent.TButton")
-        self.btn_try.pack(side="left", padx=4)
         # các khung cài đặt luôn hiện đủ; thiếu chỗ thì danh sách ảnh co lại
-        for w in (fi, fs, fa, f4):
+        for w in (fs, fa):
             w.pack_forget()
-        for w in (f4, fa, fs):
+        for w in (test_panel(p2), fa, fs):
             w.pack(side="bottom", fill="x", padx=4, pady=4)
         fi.pack(fill="both", expand=True, padx=4, pady=4)
+        test_panel(p3).pack(side="bottom", fill="x", padx=4, pady=4)
+        ttk.Label(p3, foreground="#666", text="Cài đặt chung (chu kỳ quét, độ chính xác...) nằm ở Bước 2. "
+                  "Danh sách Xem QC lưu riêng trong file workflow_qc.json.").pack(side="bottom", anchor="w", padx=8)
+        fi3.pack(fill="both", expand=True, padx=4, pady=4)
 
         # ================= Điều khiển + log =================
         f5 = ttk.Frame(self)
         self.btn_start = ttk.Button(f5, text="▶ BẮT ĐẦU", command=self.start, width=12, style="Start.TButton")
         self.btn_start.pack(side="left")
-        self.btn_qc = ttk.Button(f5, text="📺 Xem quảng cáo", command=lambda: self.start(job="qc"), width=18,
+        self.btn_qc = ttk.Button(f5, text="📺 Chỉ Xem QC", command=lambda: self.start(job="qc"), width=18,
                                  style="Accent.TButton")
         self.btn_qc.pack(side="left", padx=(6, 0))
         self.btn_pause = ttk.Button(f5, text="Tạm dừng", command=self.toggle_pause, width=10, state="disabled", style="Pause.TButton")
@@ -1493,6 +1513,7 @@ class App(tk.Tk):
             self.checked = set(ids)
         self.fill_list()
         self.nb.tab(1, state="normal")
+        self.nb.tab(2, state="normal")
         self.log(f"Đã quét: tìm thấy {len(inst)} tab trong LD (tab {min(ids) + 1} - {max(ids) + 1}).")
 
     def start_from(self):
@@ -1573,12 +1594,18 @@ class App(tk.Tk):
 
     # ---- danh sách ảnh cần click (2 danh sách: Mục 1 & Mục 2 xem quảng cáo)
     def select_list(self, k, switch_tab=True):
-        """Chọn danh sách đang làm việc ở Bước 2 (các nút Chụp ảnh/Xóa/Lên/Xuống tác động lên danh sách này)."""
+        """Chọn danh sách đang làm việc: 1 = Điểm danh (Bước 2), 2 = Xem QC (Bước 3).
+        Các nút Chụp ảnh/Xóa/Lên/Xuống tác động lên danh sách này."""
         self.cur = k
         self.steps = self.lists[k]
         self.tree = self.trees[k]
-        if switch_tab and self.lists_nb.index("current") != k - 1:
-            self.lists_nb.select(k - 1)
+        if switch_tab and self.nb.index("current") != k and str(self.nb.tab(k, "state")) == "normal":
+            self.nb.select(k)
+
+    def on_page_change(self):
+        page = self.nb.index("current")
+        if page in (1, 2) and page != self.cur:
+            self.select_list(page, switch_tab=False)
 
     def refresh_tree(self, select=None):
         self.tree.delete(*self.tree.get_children())
@@ -1728,7 +1755,7 @@ class App(tk.Tk):
         """Chèn 1 bước không ảnh ngay dưới dòng đang chọn (chưa chọn thì thêm cuối danh sách)."""
         if self.cur != 2:
             messagebox.showinfo("Bước không ảnh", "Bước ra màn hình chính rồi vào lại game chỉ dùng ở "
-                                                  "Mục 2 (Xem quảng cáo).")
+                                                  "danh sách Xem QC.")
             return
         idx = self.selected()
         pos = len(self.steps) if idx is None else idx + 1
@@ -1926,7 +1953,8 @@ class App(tk.Tk):
     def set_running(self, running):
         self.btn_start.config(state="disabled" if running else "normal")
         self.btn_qc.config(state="disabled" if running else "normal")
-        self.btn_try.config(state="disabled" if running else "normal")
+        for b in self.btn_trys:
+            b.config(state="disabled" if running else "normal")
         self.btn_pause.config(state="normal" if running else "disabled", text="Tạm dừng")
         self.btn_stop.config(state="normal" if running else "disabled")
         self.btn_skip.config(state="normal" if running else "disabled")
@@ -2056,7 +2084,7 @@ class App(tk.Tk):
                 if self.lists[2]:
                     keys.append(2)
                 else:
-                    self.log("Lưu ý: đã tick tự chạy Mục 2 nhưng danh sách Mục 2 (xem quảng cáo) đang trống, bỏ qua Mục 2")
+                    self.log("Lưu ý: đã tick chạy Xem QC nhưng danh sách Xem QC đang trống, chỉ chạy Điểm danh")
         for k in keys:
             if not self.lists[k]:
                 err(f"Danh sách {LIST_NAMES[k]} đang trống. Hãy thêm ít nhất 1 ảnh (ảnh cuối cùng là ảnh kết thúc).")
@@ -2100,13 +2128,13 @@ class App(tk.Tk):
                 if self.stop_ev.is_set():
                     break
                 if n > 0:
-                    self.log(f"=== XONG MỤC TRƯỚC -> CHẠY LẠI TỪ ĐẦU VỚI {LIST_NAMES[k]} ===")
+                    self.log(f"=== ĐIỂM DANH XONG HẾT CÁC TAB -> QUAY LẠI TAB ĐẦU CHẠY {LIST_NAMES[k]} ===")
                     time.sleep(float(cfg.get("post_batch_wait", 3)))
                     if self.stop_ev.is_set():
                         break
                 if len(jobs) > 1 or k == 2:
                     self.log(f"=== {LIST_NAMES[k]}: {len(steps)} ảnh ===")
-                short = "Mục 1" if k == 1 else "Quảng cáo"
+                short = "Điểm danh" if k == 1 else "Xem QC"
                 prog = (lambda s: (lambda v, mx, t: self.progress(v, mx, f"{s}: {t}")))(short)
                 self.skip_ev.clear()
                 Runner(cfg, steps, self.log, prog, self.stop_ev, self.pause_ev, self.skip_ev).run()
