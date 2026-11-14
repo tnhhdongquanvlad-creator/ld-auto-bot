@@ -454,6 +454,7 @@ class Vision:
 
 
 PACK_KEYS = ("pack", "pack_times")
+PACK_RETRY = 60    # giây: trong gói, chờ 1 ảnh quá lâu thì lùi lại làm lại 1-2 bước ngay trước nó
 
 
 def copy_pack(src, dst):
@@ -659,8 +660,10 @@ class Runner:
     # ---- chạy 1 GÓI: làm lần lượt từng bước trong gói, lặp đủ số lần
     def run_pack(self, i, members, times, total, deadline):
         """members = [(n, st, tpl)] các bước liền nhau trong gói (tpl None = bước không ảnh).
-        Làm LIÊN TỤC từng bước theo thứ tự, KHÔNG BỎ BƯỚC: ảnh nào chưa hiện thì chờ tới khi hiện
-        (vd hết QC thì chờ có QC lại). Lặp đủ số lần mới thôi; trong lúc chạy gói không xét ảnh cuối.
+        Làm LIÊN TỤC từng bước theo thứ tự, KHÔNG BỎ BƯỚC. Ảnh nào chờ quá PACK_RETRY giây chưa hiện
+        thì lùi lại làm lại bước trước (lần đầu lùi 1 bước, các lần sau lùi 2 bước) rồi chờ tiếp
+        (ảnh đầu gói, vd hết QC, thì cứ chờ).
+        Lặp đủ số lần mới thôi; trong lúc chạy gói không xét ảnh cuối.
         Trả về False nếu bị dừng giữa chừng (bỏ qua đợt / hết giờ tab)."""
         tab = i + 1
         gap = max(0.5, float(self.cfg["step_interval"]))
@@ -669,13 +672,18 @@ class Runner:
         self.remember_game(i)
         done = 0
         while done < times:
-            for k, (n, st, tpl) in enumerate(members):
+            k = 0
+            fails = {}      # số lần chờ quá lâu của từng bước trong lượt này: lần 1 lùi 1 bước, từ lần 2 lùi 2 bước
+            while k < len(members):
+                n, st, tpl = members[k]
                 if tpl is None:
                     self.check()
                     self.run_noimg(i, n, total, st)
+                    k += 1
                     continue
-                # chờ tới khi ảnh hiện (không giới hạn thời gian), cứ 10 phút ghi nhật ký 1 lần
+                # chờ ảnh hiện; quá PACK_RETRY giây thì làm lại 2 bước trước (ảnh đầu gói thì cứ chờ)
                 t0 = last_log = time.time()
+                back = False
                 while True:
                     self.check()
                     if self.skip.is_set() or (deadline and time.time() >= deadline):
@@ -691,11 +699,21 @@ class Runner:
                             break
                         self.log(f"Tab {tab}: #{n} thao tác lỗi (ADB), tìm lại ảnh rồi thử tiếp")
                     now = time.time()
-                    if now - last_log >= (60 if last_log == t0 else 600):
+                    if k > 0 and now - t0 >= PACK_RETRY:
+                        fails[k] = fails.get(k, 0) + 1
+                        j = max(0, k - (1 if fails[k] == 1 else 2))
+                        self.log(f"Tab {tab}: gói lần {done + 1}/{times}: chờ ảnh #{n} '{st['image']}' quá "
+                                 f"{PACK_RETRY}s không thấy -> LÀM LẠI từ bước #{members[j][0]}")
+                        k, back = j, True
+                        break
+                    if k == 0 and now - last_log >= (60 if last_log == t0 else 600):
                         last_log = now
                         self.log(f"Tab {tab}: gói lần {done + 1}/{times}: đang chờ ảnh #{n} '{st['image']}' hiện "
-                                 f"(đã chờ {int((now - t0) // 60)} phút{', hết QC?' if k == 0 else ''})")
+                                 f"(đã chờ {int((now - t0) // 60)} phút, hết QC?)")
                     self.sleep(gap)
+                if back:
+                    continue
+                k += 1
                 self.sleep(min(gap, 1.0))   # chờ màn hình đổi rồi mới tìm ảnh tiếp theo
             done += 1
             self.log(f"Tab {tab}: gói #{a}-#{b}: XONG LẦN {done}/{times}")
@@ -1632,7 +1650,8 @@ class App(tk.Tk):
             row=0, column=1, sticky="w", padx=4)
         ttk.Label(win, foreground="#666", wraplength=380, justify="left",
                   text="Khi thấy ảnh đầu tiên của gói, bot làm LIÊN TỤC từng dòng trong gói từ trên xuống, "
-                       "KHÔNG BỎ BƯỚC: ảnh nào chưa hiện thì chờ tới khi hiện (vd hết quảng cáo thì chờ có lại). "
+                       "KHÔNG BỎ BƯỚC. Ảnh nào chờ quá 1 phút chưa hiện thì lùi lại làm lại dòng trước (lần đầu lùi "
+                       "1 dòng, các lần sau lùi 2 dòng) rồi chờ tiếp.Ảnh đầu gói (vd hết quảng cáo) thì chờ tới khi có lại. "
                        "Lặp đủ số lần rồi mới làm các dòng sau gói."
                   ).pack(anchor="w", padx=14, pady=(0, 8))
 
