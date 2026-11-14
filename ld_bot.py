@@ -453,7 +453,7 @@ class Vision:
         return None
 
 
-PACK_KEYS = ("pack", "pack_times")
+PACK_KEYS = ("pack", "pack_times", "pack_must")   # pack_must = gói BẮT BUỘC (bấm đúng thứ tự, chờ tới khi được)
 PACK_RETRY = 60    # giây: trong gói, chờ 1 ảnh quá lâu thì lùi lại làm lại 1-2 bước ngay trước nó
 
 
@@ -463,6 +463,8 @@ def copy_pack(src, dst):
         if src.get("pack"):
             dst["pack"] = int(src["pack"])
             dst["pack_times"] = max(1, int(src.get("pack_times", 1)))
+            if src.get("pack_must"):
+                dst["pack_must"] = True
     except (TypeError, ValueError):
         for k in PACK_KEYS:
             dst.pop(k, None)
@@ -470,7 +472,7 @@ def copy_pack(src, dst):
 
 
 def find_packs(steps):
-    """Các gói trong danh sách: [(đầu, cuối, số lần)] đánh số từ 1.
+    """Các gói trong danh sách: [(đầu, cuối, số lần, bắt buộc?)] đánh số từ 1.
     Gói = các bước LIỀN NHAU cùng mã 'pack'. Bước cuối danh sách không bao giờ nằm trong gói."""
     packs, n = [], 0
     last = len(steps) - 1
@@ -483,7 +485,8 @@ def find_packs(steps):
         while e + 1 < last and steps[e + 1].get("pack") == pid:
             e += 1
         st = steps[n]
-        packs.append((n + 1, e + 1, int(st.get("pack_times", 1))))
+        must = bool(st.get("pack_must"))
+        packs.append((n + 1, e + 1, 1 if must else int(st.get("pack_times", 1)), must))
         n = e + 1
     return packs
 
@@ -658,17 +661,18 @@ class Runner:
         return ok
 
     # ---- chạy 1 GÓI: làm lần lượt từng bước trong gói, lặp đủ số lần
-    def run_pack(self, i, members, times, total, deadline):
+    def run_pack(self, i, members, times, total, deadline, must=False):
         """members = [(n, st, tpl)] các bước liền nhau trong gói (tpl None = bước không ảnh).
-        Làm LIÊN TỤC từng bước theo thứ tự, KHÔNG BỎ BƯỚC. Ảnh nào chờ quá PACK_RETRY giây chưa hiện
+        Gói lặp: làm LIÊN TỤC từng bước theo thứ tự, KHÔNG BỎ BƯỚC. Ảnh nào chờ quá PACK_RETRY giây chưa hiện
         thì lùi lại làm lại bước trước (lần đầu lùi 1 bước, các lần sau lùi 2 bước) rồi chờ tiếp
-        (ảnh đầu gói, vd hết QC, thì cứ chờ).
-        Lặp đủ số lần mới thôi; trong lúc chạy gói không xét ảnh cuối.
-        Trả về False nếu bị dừng giữa chừng (bỏ qua đợt / hết giờ tab)."""
+        (ảnh đầu gói, vd hết QC, thì cứ chờ). Lặp đủ số lần mới thôi.
+        Gói BẮT BUỘC (must): chạy 1 lần, bấm đúng thứ tự từ trên xuống, ảnh chưa hiện thì cứ chờ, không lùi bước.
+        Trong lúc chạy gói không xét ảnh cuối. Trả về False nếu bị dừng giữa chừng (bỏ qua đợt / hết giờ tab)."""
         tab = i + 1
         gap = max(0.5, float(self.cfg["step_interval"]))
         a, b = members[0][0], members[-1][0]
-        self.log(f"Tab {tab}: ▶ BẮT ĐẦU GÓI #{a}-#{b}, lặp {times} lần")
+        kind = "GÓI BẮT BUỘC" if must else "GÓI"
+        self.log(f"Tab {tab}: ▶ BẮT ĐẦU {kind} #{a}-#{b}" + ("" if must else f", lặp {times} lần"))
         self.remember_game(i)
         done = 0
         while done < times:
@@ -699,14 +703,19 @@ class Runner:
                             break
                         self.log(f"Tab {tab}: #{n} thao tác lỗi (ADB), tìm lại ảnh rồi thử tiếp")
                     now = time.time()
-                    if k > 0 and now - t0 >= PACK_RETRY:
+                    if must:
+                        if now - last_log >= (60 if last_log == t0 else 600):
+                            last_log = now
+                            self.log(f"Tab {tab}: gói bắt buộc: đang chờ ảnh #{n} '{st['image']}' hiện để bấm "
+                                     f"(đã chờ {int((now - t0) // 60)} phút, không bỏ bước)")
+                    elif k > 0 and now - t0 >= PACK_RETRY:
                         fails[k] = fails.get(k, 0) + 1
                         j = max(0, k - (1 if fails[k] == 1 else 2))
                         self.log(f"Tab {tab}: gói lần {done + 1}/{times}: chờ ảnh #{n} '{st['image']}' quá "
                                  f"{PACK_RETRY}s không thấy -> LÀM LẠI từ bước #{members[j][0]}")
                         k, back = j, True
                         break
-                    if k == 0 and now - last_log >= (60 if last_log == t0 else 600):
+                    elif k == 0 and now - last_log >= (60 if last_log == t0 else 600):
                         last_log = now
                         self.log(f"Tab {tab}: gói lần {done + 1}/{times}: đang chờ ảnh #{n} '{st['image']}' hiện "
                                  f"(đã chờ {int((now - t0) // 60)} phút, hết QC?)")
@@ -716,8 +725,9 @@ class Runner:
                 k += 1
                 self.sleep(min(gap, 1.0))   # chờ màn hình đổi rồi mới tìm ảnh tiếp theo
             done += 1
-            self.log(f"Tab {tab}: gói #{a}-#{b}: XONG LẦN {done}/{times}")
-        self.log(f"Tab {tab}: ✔ XONG GÓI #{a}-#{b}: đủ {times}/{times} lần")
+            if not must:
+                self.log(f"Tab {tab}: gói #{a}-#{b}: XONG LẦN {done}/{times}")
+        self.log(f"Tab {tab}: ✔ XONG {kind} #{a}-#{b}" + ("" if must else f": đủ {times}/{times} lần"))
         return True
 
     # ---- làm hành động đã chọn cho ảnh vừa thấy (m = tọa độ tâm ảnh)
@@ -781,7 +791,7 @@ class Runner:
         # gói: các bước liền nhau gộp lại, lặp N lần. Thấy ảnh ĐẦU TIÊN của gói thì chạy cả gói (1 lần duy nhất mỗi tab)
         packs = find_packs(self.steps)
         in_pack, trigger, packs_done = {}, {}, set()
-        for gi, (a, b, _t) in enumerate(packs):
+        for gi, (a, b, _t, _m) in enumerate(packs):
             for n in range(a, b + 1):
                 in_pack[n] = gi
             first = next((n for n in range(a, b + 1) if imgs[n - 1][2] is not None), None)
@@ -889,8 +899,8 @@ class Runner:
                     act = st.get("action", "click")
                     if n in trigger:
                         gi = trigger[n]
-                        a, b, times = packs[gi]
-                        if not self.run_pack(i, imgs[a - 1:b], times, total, deadline):
+                        a, b, times, must = packs[gi]
+                        if not self.run_pack(i, imgs[a - 1:b], times, total, deadline, must):
                             continue      # bị dừng/hết giờ: vòng lặp sẽ tự xử lý ở lượt quét kế
                         packs_done.add(gi)
                         clicks += 1
@@ -1340,6 +1350,7 @@ class App(tk.Tk):
             tr.tag_configure("odd", background="#f5f3ff")
             tr.tag_configure("final", background="#dcfce7", foreground="#166534")
             tr.tag_configure("pack", background="#ffedd5", foreground="#9a3412")
+            tr.tag_configure("must", background="#dbeafe", foreground="#1e40af")
             tr.bind("<Double-1>", lambda e: self.edit_action())
             self.trees[k] = tr
         self.tree = self.trees[1]
@@ -1353,11 +1364,9 @@ class App(tk.Tk):
             ttk.Button(bf, text=text, command=cmd, width=15,
                        style="Accent.TButton" if text == "Chụp ảnh mới" else "TButton").grid(
                 row=r, column=c, padx=2, pady=2, sticky="ew")
-        ttk.Button(bf, text="➕ Bước không ảnh (ra rồi vào lại game)",
-                   command=self.add_noimg).grid(row=3, column=0, columnspan=2, padx=2, pady=2, sticky="ew")
-        ttk.Button(bf, text="📦 Gộp gói...", command=self.make_pack, width=15).grid(
-            row=4, column=0, padx=2, pady=2, sticky="ew")
-        ttk.Button(bf, text="Bỏ gói", command=self.unpack, width=15).grid(row=4, column=1, padx=2, pady=2, sticky="ew")
+        for text, cmd, r, c in (("➕ Không ảnh", self.add_noimg, 3, 0), ("Bỏ gói", self.unpack, 3, 1),
+                                ("📦 Gói lặp...", self.make_pack, 4, 0), ("🔒 Gói bắt buộc", self.make_must, 4, 1)):
+            ttk.Button(bf, text=text, command=cmd, width=15).grid(row=r, column=c, padx=2, pady=2, sticky="ew")
 
         fs = ttk.LabelFrame(p2, text=" Cài đặt (đơn vị: giây) ", padding=6)
         fs.pack(fill="x", padx=4, pady=4)
@@ -1574,13 +1583,17 @@ class App(tk.Tk):
     def refresh_tree(self, select=None):
         self.tree.delete(*self.tree.get_children())
         n_total = len(self.steps)
-        pack_note = {}
-        for k, (a, b, t) in enumerate(find_packs(self.steps), 1):
+        pack_note, pack_tag = {}, {}
+        for k, (a, b, t, must) in enumerate(find_packs(self.steps), 1):
             for n in range(a, b + 1):
-                pack_note[n] = f"📦 Gói {k}: lặp {t} lần" if n == a else f"📦 Gói {k}"
+                if must:
+                    pack_note[n] = f"🔒 Gói {k}: bắt buộc" if n == a else f"🔒 Gói {k}"
+                else:
+                    pack_note[n] = f"📦 Gói {k}: lặp {t} lần" if n == a else f"📦 Gói {k}"
+                pack_tag[n] = "must" if must else "pack"
         for n, st in enumerate(self.steps, 1):
             note = "ẢNH CUỐI → tắt tab" if n == n_total else pack_note.get(n, "")
-            tag = "final" if n == n_total else "pack" if n in pack_note else ("odd" if n % 2 else "even")
+            tag = "final" if n == n_total else pack_tag.get(n) or ("odd" if n % 2 else "even")
             if n == n_total and is_noimg(st):
                 note = "BƯỚC CUỐI → tắt tab"
             img = "(không ảnh)" if is_noimg(st) else st["image"]
@@ -1620,22 +1633,50 @@ class App(tk.Tk):
         sel = [int(x) for x in self.tree.selection()]
         return (min(sel), max(sel)) if sel else None
 
-    def make_pack(self):
-        """Gộp các dòng liền nhau đang chọn thành 1 gói, lặp N lần."""
+    def pack_range(self, title):
+        """Kiểm tra các dòng đang chọn có gộp thành gói được không -> (đầu, cuối) hoặc None."""
         rg = self.selected_range()
         if rg is None:
-            messagebox.showinfo("Gộp gói", "Chọn các dòng muốn gộp: bấm dòng đầu, giữ Shift rồi bấm dòng cuối.")
-            return
+            messagebox.showinfo(title, "Chọn các dòng muốn gộp: bấm dòng đầu, giữ Shift rồi bấm dòng cuối.")
+            return None
         lo, hi = rg
         if hi >= len(self.steps) - 1:
-            messagebox.showerror("Gộp gói", "Dòng CUỐI danh sách (bước kết thúc, xong thì tắt tab) "
-                                            "không được nằm trong gói.\nHãy chọn các dòng phía trên nó.")
-            return
+            messagebox.showerror(title, "Dòng CUỐI danh sách (bước kết thúc, xong thì tắt tab) "
+                                        "không được nằm trong gói.\nHãy chọn các dòng phía trên nó.")
+            return None
         if all(is_noimg(st) for st in self.steps[lo:hi + 1]):
-            messagebox.showerror("Gộp gói", "Gói cần có ít nhất 1 dòng có ảnh.")
+            messagebox.showerror(title, "Gói cần có ít nhất 1 dòng có ảnh.")
+            return None
+        return rg
+
+    def set_pack(self, lo, hi, **fields):
+        """Gán các dòng lo..hi vào 1 gói mới (xóa thông tin gói cũ của các dòng này)."""
+        pid = max([int(s.get("pack", 0)) for s in self.steps] + [0]) + 1
+        for st in self.steps[lo:hi + 1]:
+            for k in PACK_KEYS + ("pack_wait",):
+                st.pop(k, None)
+            st.update(pack=pid, **fields)
+        self.refresh_tree(lo)
+
+    def make_must(self):
+        """Gộp các dòng đang chọn thành GÓI BẮT BUỘC: bấm đúng thứ tự từ trên xuống, chưa bấm được thì chờ."""
+        rg = self.pack_range("Gói bắt buộc")
+        if rg and messagebox.askyesno(
+                "Gói bắt buộc",
+                f"Gộp #{rg[0] + 1} đến #{rg[1] + 1} thành GÓI BẮT BUỘC?\n\n"
+                "Khi thấy ảnh đầu tiên của gói, bot bấm lần lượt từng dòng từ trên xuống, đúng thứ tự. "
+                "Ảnh nào chưa hiện thì CHỜ tới khi bấm được, không bỏ bước, không lùi bước. "
+                "Xong cả gói (1 lần) mới làm các dòng sau gói."):
+            self.set_pack(rg[0], rg[1], pack_times=1, pack_must=True)
+
+    def make_pack(self):
+        """Gộp các dòng liền nhau đang chọn thành 1 gói, lặp N lần."""
+        rg = self.pack_range("Gộp gói")
+        if rg is None:
             return
+        lo, hi = rg
         old = self.steps[lo]
-        times = tk.IntVar(value=int(old.get("pack_times", 50)))
+        times = tk.IntVar(value=50 if old.get("pack_must") else int(old.get("pack_times", 50)))
         win = tk.Toplevel(self)
         win.title("Gộp thành gói")
         win.configure(bg=PAL["bg"])
@@ -1651,7 +1692,7 @@ class App(tk.Tk):
         ttk.Label(win, foreground="#666", wraplength=380, justify="left",
                   text="Khi thấy ảnh đầu tiên của gói, bot làm LIÊN TỤC từng dòng trong gói từ trên xuống, "
                        "KHÔNG BỎ BƯỚC. Ảnh nào chờ quá 1 phút chưa hiện thì lùi lại làm lại dòng trước (lần đầu lùi "
-                       "1 dòng, các lần sau lùi 2 dòng) rồi chờ tiếp.Ảnh đầu gói (vd hết quảng cáo) thì chờ tới khi có lại. "
+                       "1 dòng, các lần sau lùi 2 dòng) rồi chờ tiếp. Ảnh đầu gói (vd hết quảng cáo) thì chờ tới khi có lại. "
                        "Lặp đủ số lần rồi mới làm các dòng sau gói."
                   ).pack(anchor="w", padx=14, pady=(0, 8))
 
@@ -1661,12 +1702,8 @@ class App(tk.Tk):
             except (tk.TclError, ValueError):
                 messagebox.showerror("Gộp gói", "Số lần chưa đúng.", parent=win)
                 return
-            pid = max([int(s.get("pack", 0)) for s in self.steps] + [0]) + 1
-            for st in self.steps[lo:hi + 1]:
-                st.pop("pack_wait", None)
-                st.update(pack=pid, pack_times=t)
             win.destroy()
-            self.refresh_tree(lo)
+            self.set_pack(lo, hi, pack_times=t)
 
         bf = ttk.Frame(win)
         bf.pack(fill="x", padx=14, pady=(0, 12))
@@ -1679,7 +1716,7 @@ class App(tk.Tk):
         rg = self.selected_range()
         pids = {self.steps[n].get("pack") for n in range(rg[0], rg[1] + 1)} - {None} if rg else set()
         if not pids:
-            messagebox.showinfo("Bỏ gói", "Hãy chọn 1 dòng nằm trong gói (dòng màu cam).")
+            messagebox.showinfo("Bỏ gói", "Hãy chọn 1 dòng nằm trong gói (dòng màu cam hoặc xanh).")
             return
         for st in self.steps:
             if st.get("pack") in pids:
