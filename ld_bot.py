@@ -37,7 +37,10 @@ APP_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else o
 TEMPLATE_DIR = os.path.join(APP_DIR, "templates")
 LOG_DIR = os.path.join(APP_DIR, "logs")
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
-WORKFLOW_FILE = os.path.join(APP_DIR, "workflow.json")
+WORKFLOW_FILE = os.path.join(APP_DIR, "workflow.json")          # Mục 1: danh sách chính
+WORKFLOW_QC_FILE = os.path.join(APP_DIR, "workflow_qc.json")    # Mục 2: xem quảng cáo (danh sách riêng)
+LIST_FILES = {1: WORKFLOW_FILE, 2: WORKFLOW_QC_FILE}
+LIST_NAMES = {1: "MỤC 1 (danh sách chính)", 2: "MỤC 2 (xem quảng cáo)"}
 os.makedirs(TEMPLATE_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -60,6 +63,7 @@ DEFAULT_CONFIG = {
     "cfg_version": 1,
     "stuck_scans": 30,        # quét liên tiếp N lần không thấy ảnh nào -> tắt, mở lại tab, quét lại từ đầu (0 = tắt)
     "stuck_max_restarts": 5,  # số lần mở lại tối đa cho mỗi tab
+    "max_tries": 2,           # mỗi ảnh bấm tối đa N lần (vẫn còn ảnh = không ăn) rồi chuyển ảnh tiếp theo
     "sort_windows": True,
     "after_sort_wait": 2.0,
     "auto_adb": True,
@@ -72,7 +76,48 @@ DEFAULT_CONFIG = {
     "daily_enabled": False,   # mỗi ngày tự chạy lại từ đầu vào giờ hẹn
     "daily_hour": 6,
     "daily_minute": 0,
+    "chain_qc": False,        # xong Mục 1 thì tự chạy lại từ đầu với Mục 2 (xem quảng cáo)
 }
+
+# Hành động khi thấy ảnh (cột "Hành động" ở Bước 2)
+ACTIONS = [
+    ("click", "Click vào ảnh"),
+    ("swipe_up", "Vuốt lên (xem phía dưới)"),
+    ("swipe_down", "Vuốt xuống (xem phía trên)"),
+    ("swipe_left", "Vuốt sang trái"),
+    ("swipe_right", "Vuốt sang phải"),
+    ("back", "Click ảnh, bấm Back, rồi vào lại game"),
+    ("hide_reopen", "Ẩn app, chờ rồi mở lại"),
+    ("click_hide_reopen", "Click, rồi ẩn app, chờ rồi mở lại (bỏ qua quảng cáo)"),
+]
+ACTION_LABEL = dict(ACTIONS)
+WAIT_ACTIONS = ("hide_reopen", "click_hide_reopen")   # các hành động có ô "Chờ (giây)"
+BACK_WAITS = (("click_wait", 3.0), ("back_wait", 3.0), ("game_wait", 3.0))  # 3 khoảng chờ của hành động Back
+# "Bước không ảnh": không tìm ảnh, chạy ngay sau bước đứng trước nó: chờ -> về màn hình chính -> chờ -> vào lại game
+NOIMG = "home_reopen"
+NOIMG_WAITS = (("pre_wait", 2.0), ("wait", 2.0))
+
+
+def is_noimg(st):
+    return st.get("action") == NOIMG
+
+
+def action_text(st):
+    a = st.get("action", "click")
+    if a == NOIMG:
+        pw, w = (f"{float(st.get(k, d)):g}" for k, d in NOIMG_WAITS)
+        return f"Chờ {pw}s, ra màn hình chính, chờ {w}s, vào lại game"
+    if a == "back":
+        cw, bw, gw = (f"{float(st.get(k, d)):g}" for k, d in BACK_WAITS)
+        return f"Click, chờ {cw}s, bấm Back, chờ {bw}s, vào lại game, chờ {gw}s"
+    w = f"{float(st.get('wait', 5)):g}"
+    if a == "hide_reopen":
+        return f"Ẩn app, chờ {w} giây rồi mở lại"
+    if a == "click_hide_reopen":
+        cw = f"{float(st.get('click_wait', 1)):g}"
+        return f"Click, chờ {cw}s, ẩn app {w}s, mở lại"
+    return ACTION_LABEL.get(a, ACTION_LABEL["click"])
+
 
 def load_json(path, default):
     try:
@@ -335,6 +380,42 @@ class LD:
         except Exception:
             return False
 
+    def _shell_ok(self, i, *args, timeout=20):
+        s = self.serial.get(i)
+        if not s:
+            return False
+        try:
+            return self._run([self.adb, "-s", s, "shell", *[str(a) for a in args]], timeout).returncode == 0
+        except Exception:
+            return False
+
+    def swipe(self, i, x1, y1, x2, y2, ms=450):
+        return self._shell_ok(i, "input", "swipe", int(x1), int(y1), int(x2), int(y2), int(ms))
+
+    def key(self, i, code):
+        """code: KEYCODE_HOME, KEYCODE_BACK..."""
+        return self._shell_ok(i, "input", "keyevent", code)
+
+    def current_app(self, i):
+        """Tên gói của app đang hiện trên màn hình (vd com.igs.goldentigerslots), không rõ thì None."""
+        s = self.serial.get(i)
+        if not s:
+            return None
+        try:
+            out = self.adb_cmd(s, "shell", "dumpsys", "window", "windows", timeout=20)
+            for key in ("mCurrentFocus", "mFocusedApp"):
+                for line in out.splitlines():
+                    if key in line:
+                        m = re.search(r"\s([A-Za-z][\w.]*\.[\w.]+)/", line)
+                        if m:
+                            return m.group(1)
+        except Exception:
+            pass
+        return None
+
+    def open_app(self, i, pkg):
+        return self._shell_ok(i, "monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1", timeout=30)
+
 
 # ----------------------------------------------------------------------------
 # Nhận diện hình ảnh
@@ -372,15 +453,77 @@ class Vision:
         return None
 
 
-def load_steps():
-    """workflow.json: danh sách ảnh theo thứ tự [{"image": "ten.png"}, ...]
-    (tự chuyển đổi từ định dạng cũ: chỉ giữ các bước có ảnh)."""
-    raw = load_json(WORKFLOW_FILE, [])
+PACK_KEYS = ("pack", "pack_times")
+
+
+def copy_pack(src, dst):
+    """Chép thông tin 'gói' (nhiều bước gộp lại, lặp N lần) từ bước src sang dst nếu hợp lệ."""
+    try:
+        if src.get("pack"):
+            dst["pack"] = int(src["pack"])
+            dst["pack_times"] = max(1, int(src.get("pack_times", 1)))
+    except (TypeError, ValueError):
+        for k in PACK_KEYS:
+            dst.pop(k, None)
+    return dst
+
+
+def find_packs(steps):
+    """Các gói trong danh sách: [(đầu, cuối, số lần)] đánh số từ 1.
+    Gói = các bước LIỀN NHAU cùng mã 'pack'. Bước cuối danh sách không bao giờ nằm trong gói."""
+    packs, n = [], 0
+    last = len(steps) - 1
+    while n < last:
+        pid = steps[n].get("pack")
+        if not pid:
+            n += 1
+            continue
+        e = n
+        while e + 1 < last and steps[e + 1].get("pack") == pid:
+            e += 1
+        st = steps[n]
+        packs.append((n + 1, e + 1, int(st.get("pack_times", 1))))
+        n = e + 1
+    return packs
+
+
+def load_steps(path=WORKFLOW_FILE):
+    """workflow.json: danh sách ảnh theo thứ tự [{"image": "ten.png", "action": "click", "wait": 5}, ...]
+    (tự chuyển đổi từ định dạng cũ: chỉ giữ các bước có ảnh; thiếu hành động thì là click)."""
+    raw = load_json(path, [])
     steps = []
     if isinstance(raw, list):
         for st in raw:
-            if isinstance(st, dict) and st.get("image"):
-                steps.append({"image": st["image"]})
+            if isinstance(st, dict) and st.get("action") == NOIMG:
+                step = {"action": NOIMG}
+                for k, d in NOIMG_WAITS:
+                    try:
+                        step[k] = max(0.0, float(st.get(k, d)))
+                    except (TypeError, ValueError):
+                        step[k] = d
+                steps.append(copy_pack(st, step))
+            elif isinstance(st, dict) and st.get("image"):
+                step = {"image": st["image"]}
+                a = st.get("action", "click")
+                if a in ACTION_LABEL and a != "click":
+                    step["action"] = a
+                if a in WAIT_ACTIONS:
+                    try:
+                        step["wait"] = max(0.0, float(st.get("wait", 5)))
+                    except (TypeError, ValueError):
+                        step["wait"] = 5.0
+                if a == "click_hide_reopen":
+                    try:
+                        step["click_wait"] = max(0.0, float(st.get("click_wait", 1)))
+                    except (TypeError, ValueError):
+                        step["click_wait"] = 1.0
+                if a == "back":
+                    for k, d in BACK_WAITS:
+                        try:
+                            step[k] = max(0.0, float(st.get(k, d)))
+                        except (TypeError, ValueError):
+                            step[k] = d
+                steps.append(copy_pack(st, step))
     return steps
 
 
@@ -399,6 +542,7 @@ class Runner:
         self.ld = LD(cfg["ld_dir"])
         self.thr = float(cfg["match_percent"]) / 100.0
         self.fails = {}
+        self.last_pkg = {}   # app (game) đang chạy của từng tab, để "Ẩn app rồi mở lại" biết mở lại app nào
         self.popups = sorted(f for f in os.listdir(TEMPLATE_DIR)
                              if f.lower().startswith("popup_") and f.lower().endswith(".png"))
 
@@ -487,17 +631,173 @@ class Runner:
             self.sleep(1)
         return False
 
+    # ---- nhớ game đang chạy (bỏ qua màn hình chính của máy ảo) để lát nữa mở lại đúng game
+    def remember_game(self, i):
+        pkg = self.ld.current_app(i)
+        if pkg and "launcher" not in pkg.lower():
+            self.last_pkg[i] = pkg
+
+    # ---- bước không ảnh: chờ -> về màn hình chính -> chờ -> vào lại game
+    def run_noimg(self, i, n, total, st):
+        tab = i + 1
+        pw, w = (max(0.0, float(st.get(k, d))) for k, d in NOIMG_WAITS)
+        self.sleep(pw)
+        pkg = self.last_pkg.get(i)
+        if not pkg:
+            self.remember_game(i)
+            pkg = self.last_pkg.get(i)
+        if not pkg:
+            self.log(f"Tab {tab}: #{n}/{total} không biết game nào đang mở nên không vào lại được")
+            return False
+        self.ld.key(i, "KEYCODE_HOME")
+        self.log(f"Tab {tab}: #{n}/{total} (không ảnh) ra màn hình chính, chờ {w:g}s rồi vào lại game")
+        self.sleep(w)
+        ok = self.ld.open_app(i, pkg)
+        self.sleep(2)     # chờ game hiện lại
+        return ok
+
+    # ---- chạy 1 GÓI: làm lần lượt từng bước trong gói, lặp đủ số lần
+    def run_pack(self, i, members, times, total, deadline):
+        """members = [(n, st, tpl)] các bước liền nhau trong gói (tpl None = bước không ảnh).
+        Làm LIÊN TỤC từng bước theo thứ tự, KHÔNG BỎ BƯỚC: ảnh nào chưa hiện thì chờ tới khi hiện
+        (vd hết QC thì chờ có QC lại). Lặp đủ số lần mới thôi; trong lúc chạy gói không xét ảnh cuối.
+        Trả về False nếu bị dừng giữa chừng (bỏ qua đợt / hết giờ tab)."""
+        tab = i + 1
+        gap = max(0.5, float(self.cfg["step_interval"]))
+        a, b = members[0][0], members[-1][0]
+        self.log(f"Tab {tab}: ▶ BẮT ĐẦU GÓI #{a}-#{b}, lặp {times} lần")
+        self.remember_game(i)
+        done = 0
+        while done < times:
+            for k, (n, st, tpl) in enumerate(members):
+                if tpl is None:
+                    self.check()
+                    self.run_noimg(i, n, total, st)
+                    continue
+                # chờ tới khi ảnh hiện (không giới hạn thời gian), cứ 10 phút ghi nhật ký 1 lần
+                t0 = last_log = time.time()
+                while True:
+                    self.check()
+                    if self.skip.is_set() or (deadline and time.time() >= deadline):
+                        self.log(f"Tab {tab}: gói #{a}-#{b} bị dừng giữa chừng (xong {done}/{times} lần)")
+                        return False
+                    scr = self.shot(i)
+                    m = Vision.find(scr, tpl, self.thr) if scr is not None else None
+                    if m:
+                        if k + 1 < len(members) and members[k + 1][2] is None \
+                                and st.get("action", "click") not in ("back",) + WAIT_ACTIONS:
+                            self.remember_game(i)   # nhớ game trước khi click (sau click có thể là màn hình QC)
+                        if self.do_action(i, st, m, scr):
+                            break
+                        self.log(f"Tab {tab}: #{n} thao tác lỗi (ADB), tìm lại ảnh rồi thử tiếp")
+                    now = time.time()
+                    if now - last_log >= (60 if last_log == t0 else 600):
+                        last_log = now
+                        self.log(f"Tab {tab}: gói lần {done + 1}/{times}: đang chờ ảnh #{n} '{st['image']}' hiện "
+                                 f"(đã chờ {int((now - t0) // 60)} phút{', hết QC?' if k == 0 else ''})")
+                    self.sleep(gap)
+                self.sleep(min(gap, 1.0))   # chờ màn hình đổi rồi mới tìm ảnh tiếp theo
+            done += 1
+            self.log(f"Tab {tab}: gói #{a}-#{b}: XONG LẦN {done}/{times}")
+        self.log(f"Tab {tab}: ✔ XONG GÓI #{a}-#{b}: đủ {times}/{times} lần")
+        return True
+
+    # ---- làm hành động đã chọn cho ảnh vừa thấy (m = tọa độ tâm ảnh)
+    def do_action(self, i, st, m, screen):
+        a = st.get("action", "click")
+        tab = i + 1
+        if a == "click":
+            return self.ld.tap(i, m[0], m[1])
+        if a.startswith("swipe_"):
+            h, w = screen.shape[:2]
+            cx, cy, dx, dy = w // 2, h // 2, int(w * 0.3), int(h * 0.3)
+            pts = {"swipe_up": (cx, cy + dy, cx, cy - dy), "swipe_down": (cx, cy - dy, cx, cy + dy),
+                   "swipe_left": (cx + dx, cy, cx - dx, cy), "swipe_right": (cx - dx, cy, cx + dx, cy)}[a]
+            ok = self.ld.swipe(i, *pts)
+            self.sleep(0.8)   # chờ màn hình cuộn xong
+            return ok
+        # nhớ game đang chạy TRƯỚC khi click (sau click có thể là màn hình quảng cáo)
+        self.remember_game(i)
+        if a in ("back", "click_hide_reopen") and not self.ld.tap(i, m[0], m[1]):
+            return False
+        if a == "back":
+            # click ảnh -> chờ -> Back -> chờ -> vào lại game (nếu đã rời game) -> chờ
+            cw, bw, gw = (max(0.0, float(st.get(k, d))) for k, d in BACK_WAITS)
+            self.sleep(cw)
+            self.ld.key(i, "KEYCODE_BACK")
+            self.sleep(bw)
+            pkg = self.last_pkg.get(i)
+            if pkg and self.ld.current_app(i) != pkg:
+                self.log(f"Tab {tab}: sau Back đang ở ngoài game, vào lại {pkg}")
+                self.ld.open_app(i, pkg)
+            self.sleep(gw)
+            return True
+        if a == "click_hide_reopen":
+            self.sleep(max(0.0, float(st.get("click_wait", 1))))   # chờ X giây sau khi click rồi mới ẩn app
+        if a in WAIT_ACTIONS:
+            pkg = self.last_pkg.get(i)
+            if not pkg:
+                self.log(f"Tab {tab}: không biết app nào đang mở nên không ẩn/mở lại được")
+                return False
+            wait = max(0.0, float(st.get("wait", 5)))
+            self.ld.key(i, "KEYCODE_HOME")
+            self.log(f"Tab {tab}: đã ẩn app {pkg}, chờ {wait:g} giây rồi mở lại")
+            self.sleep(wait)
+            ok = self.ld.open_app(i, pkg)
+            self.sleep(2)     # chờ app hiện lại
+            return ok
+        return self.ld.tap(i, m[0], m[1])
+
     # ---- 1 tab chạy ĐỘC LẬP
     def scan_tab(self, i, deadline):
-        """Mỗi 'step_interval' giây: chụp màn hình 1 lần, tìm TẤT CẢ ảnh trên ảnh chụp đó.
-        Ảnh cuối thấy -> click và tắt tab. Không thì click ảnh đầu tiên thấy theo thứ tự #1..N-1."""
+        """Chạy THEO LƯỢT: mỗi 'step_interval' giây chụp màn hình 1 lần.
+        - Thấy ảnh cuối lúc nào -> click và tắt tab.
+        - Không thì tìm từ ảnh đang tới (#p) trở đi, ảnh nào không thấy thì bỏ qua luôn.
+        - Ảnh bấm tối đa 'max_tries' lần mà vẫn còn -> bỏ qua, sang ảnh tiếp theo.
+        - Hết lượt (không còn ảnh nào phía sau) -> quay lại #1, lặp tới khi click được ảnh cuối.
+        - Bước không ảnh: chạy ngay sau khi làm bước đứng trước nó (bước đầu lượt thì chạy lúc bắt đầu lượt)."""
         tab = i + 1
-        imgs = [(n, st["image"], Vision.load(st["image"])) for n, st in enumerate(self.steps, 1)]
+        imgs = [(n, st, None if is_noimg(st) else Vision.load(st["image"])) for n, st in enumerate(self.steps, 1)]
         total = len(imgs)
-        order = [imgs[-1]] + imgs[:-1]          # ưu tiên ảnh cuối, rồi #1..#N-1
+
+        # gói: các bước liền nhau gộp lại, lặp N lần. Thấy ảnh ĐẦU TIÊN của gói thì chạy cả gói (1 lần duy nhất mỗi tab)
+        packs = find_packs(self.steps)
+        in_pack, trigger, packs_done = {}, {}, set()
+        for gi, (a, b, _t) in enumerate(packs):
+            for n in range(a, b + 1):
+                in_pack[n] = gi
+            first = next((n for n in range(a, b + 1) if imgs[n - 1][2] is not None), None)
+            if first:
+                trigger[first] = gi
+
+        def run_chain(after):
+            """Chạy các bước không ảnh liền sau bước #after. Trả về True nếu đã chạy tới bước cuối danh sách."""
+            j = after + 1
+            while j <= total and imgs[j - 1][2] is None and j not in in_pack:
+                self.run_noimg(i, j, total, imgs[j - 1][1])
+                if j == total:
+                    self.log(f"Tab {tab}: ĐÃ XONG BƯỚC CUỐI (không ảnh) -> tắt tab")
+                    self._safe_quit(i)
+                    return True
+                j += 1
+            return False
+
         gap = max(0.5, float(self.cfg["step_interval"]))
+        max_tries = max(1, int(self.cfg.get("max_tries", 2)))
         clicks = rounds = 0
         empty = restarts = 0
+        p, lap, misses = 1, 1, 0  # ảnh đang tới trong lượt, số lượt, số lần quét không thấy ảnh nào từ #p trở đi
+        skipped = set()          # ảnh đã bấm quá số lần mà vẫn còn -> bỏ qua trong lượt này
+        last_n, same = None, 0   # ảnh vừa làm & số lần liên tiếp vẫn thấy lại đúng ảnh đó
+        lead = True              # đầu lượt: chạy các bước không ảnh đứng đầu danh sách (nếu có)
+
+        def new_lap(why):
+            nonlocal p, lap, misses, last_n, same, lead
+            lap += 1
+            p, misses, last_n, same, lead = 1, 0, None, 0, True
+            skipped.clear()
+            self.log(f"Tab {tab}: {why} -> LẶP LẠI từ ảnh #1 (lượt {lap})")
+
         stuck_n = int(self.cfg.get("stuck_scans", 0))
         stuck_max = int(self.cfg.get("stuck_max_restarts", 5))
         start = last_hb = time.time()
@@ -512,20 +812,40 @@ class Runner:
                     self.log(f"Tab {tab}: HẾT GIỜ ({int(self.cfg['tab_timeout'])} giây) mà chưa click được "
                              f"ảnh cuối (đã click {clicks} lần, quét {rounds} lần)")
                     return False
+                if lead:
+                    lead = False
+                    if run_chain(0):
+                        return True
                 screen = self.shot(i)
                 hit = None
                 if screen is not None:
-                    for n, name, tpl in order:
-                        m = Vision.find(screen, tpl, self.thr)
-                        if m:
-                            hit = (n, name, m)
-                            break
+                    n_f, st_f, tpl_f = imgs[-1]
+                    m = tpl_f is not None and Vision.find(screen, tpl_f, self.thr)   # ảnh cuối luôn được ưu tiên
+                    if m:
+                        hit = (n_f, st_f, m)
+                    else:
+                        for n, st, tpl in imgs[p - 1:total - 1]:  # từ ảnh đang tới trở đi
+                            if tpl is None or n in skipped:
+                                continue
+                            if n in in_pack and (n not in trigger or trigger[n] in packs_done):
+                                continue   # bước trong gói chỉ chạy khi chạy cả gói
+                            m = Vision.find(screen, tpl, self.thr)
+                            if m:
+                                hit = (n, st, m)
+                                break
                     if hit is None and self.popups and self.handle_popups(i, screen):
                         empty = 0
                     elif hit is None:
-                        empty += 1
+                        if p > 1:
+                            # phía sau không còn ảnh nào thấy được: chờ thêm, quá số lần thì sang lượt mới
+                            misses += 1
+                            if misses >= max_tries:
+                                new_lap(f"đã chạy hết lượt {lap}")
+                                continue
+                        else:
+                            empty += 1
                     else:
-                        empty = 0
+                        empty = misses = 0
                     if stuck_n > 0 and empty >= stuck_n and restarts < stuck_max:
                         restarts += 1
                         self.log(f"Tab {tab}: quét {empty} lần liên tiếp không thấy ảnh nào -> "
@@ -542,20 +862,57 @@ class Runner:
                             self.log(f"Tab {tab}: mở lại không được, dừng tab này")
                             return False
                         empty = 0
+                        new_lap("đã mở lại tab")
                         self.sleep(3)
                         continue
                 if hit:
-                    n, name, m = hit
+                    n, st, m = hit
+                    name = st["image"]
+                    act = st.get("action", "click")
+                    if n in trigger:
+                        gi = trigger[n]
+                        a, b, times = packs[gi]
+                        if not self.run_pack(i, imgs[a - 1:b], times, total, deadline):
+                            continue      # bị dừng/hết giờ: vòng lặp sẽ tự xử lý ở lượt quét kế
+                        packs_done.add(gi)
+                        clicks += 1
+                        p, last_n, same, misses = b + 1, None, 0, 0
+                        if run_chain(b):
+                            return True
+                        continue
                     if n == total:
-                        if self.click_final(i, m):
-                            self.log(f"Tab {tab}: ĐÃ CLICK ẢNH CUỐI '{name}' thành công -> tắt tab "
-                                     f"(đã click {clicks + 1} lần, quét {rounds} lần)")
+                        ok = self.click_final(i, m) if act == "click" else self.do_action(i, st, m, screen)
+                        if ok:
+                            done = "ĐÃ CLICK ẢNH CUỐI" if act == "click" else f"ĐÃ XONG ẢNH CUỐI ({action_text(st)})"
+                            self.log(f"Tab {tab}: {done} '{name}' thành công -> tắt tab "
+                                     f"(đã thao tác {clicks + 1} lần, quét {rounds} lần)")
                             self._safe_quit(i)
                             return True
-                        self.log(f"Tab {tab}: click ảnh cuối '{name}' bị lỗi (ADB), sẽ thử lại")
-                    elif self.ld.tap(i, m[0], m[1]):
+                        self.log(f"Tab {tab}: thao tác ảnh cuối '{name}' bị lỗi (ADB), sẽ thử lại")
+                        self.sleep(gap)
+                        continue
+                    # đếm số lần liên tiếp vẫn thấy lại đúng ảnh này (bấm không ăn vì ảnh bị che...)
+                    same = same + 1 if last_n == n else 1
+                    last_n = n
+                    if same > max_tries:
+                        skipped.add(n)
+                        last_n, same = None, 0
+                        p = n + 1
+                        self.log(f"Tab {tab}: #{n}/{total} '{name}' bấm {max_tries} lần vẫn còn "
+                                 f"-> BỎ QUA, chuyển sang ảnh tiếp theo")
+                        if p >= total:
+                            new_lap(f"đã chạy hết lượt {lap}")
+                        continue
+                    p = n
+                    chain = n < total and imgs[n][2] is None and n + 1 not in in_pack   # ngay sau là bước không ảnh
+                    if chain and (act == "click" or act.startswith("swipe_")):   # các hành động khác tự nhớ rồi
+                        self.remember_game(i)   # nhớ game trước khi click (sau click có thể là màn hình QC)
+                    if self.do_action(i, st, m, screen):
                         clicks += 1
-                        self.log(f"Tab {tab}: #{n}/{total} thấy '{name}' -> click")
+                        self.log(f"Tab {tab}: #{n}/{total} thấy '{name}' -> {action_text(st).lower()} "
+                                 f"(lần {same}/{max_tries}, lượt {lap})")
+                        if chain and run_chain(n):
+                            return True
                 if time.time() - last_hb >= 60:
                     last_hb = time.time()
                     self.log(f"Tab {tab}: đang quét... {rounds} lần, đã click {clicks} lần "
@@ -772,13 +1129,15 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("LD Auto Bot")
-        self.geometry("980x860")
+        self.geometry("980x950")
         self.apply_theme()
         self.cfg = load_json(CONFIG_FILE, DEFAULT_CONFIG)
         if int(self.cfg.get("cfg_version", 1)) < 2:
             self.cfg["tab_timeout"] = 0   # từ bản này: tab chỉ tắt khi click được ảnh cuối
             self.cfg["cfg_version"] = 2
-        self.steps = load_steps()
+        self.lists = {k: load_steps(p) for k, p in LIST_FILES.items()}   # 1: Mục 1, 2: Mục 2 (quảng cáo)
+        self.cur = 1                    # danh sách đang hiện ở Bước 2
+        self.steps = self.lists[1]
         self.log_q = queue.Queue()
         self.stop_ev = threading.Event()
         self.pause_ev = threading.Event()
@@ -791,7 +1150,9 @@ class App(tk.Tk):
         if not console_exe(self.cfg["ld_dir"]):
             self.cfg["ld_dir"] = find_ld_dir()
         self.build_ui()
-        self.refresh_tree()
+        for k in (2, 1):                # vẽ cả 2 danh sách, để Mục 1 đang chọn
+            self.select_list(k)
+            self.refresh_tree()
         self.after(200, self.pump)
         self.after(1000, self.daily_tick)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -936,28 +1297,49 @@ class App(tk.Tk):
         # ================= TRANG 2 =================
         fi = ttk.LabelFrame(p2, text=" Danh sách ảnh cần click (theo thứ tự từ trên xuống) ", padding=6)
         fi.pack(fill="both", expand=True, padx=4, pady=4)
-        ttk.Label(fi, foreground="#4338ca", justify="left", wraplength=900,
-                  text="Cách chạy: cứ mỗi 'Chu kỳ quét' giây, tab chụp màn hình 1 lần và tìm TẤT CẢ ảnh trong danh sách, "
-                       "thấy ảnh nào thì click ảnh đó.\nClick được ảnh CUỐI CÙNG thì tab đó tắt (các tab khác vẫn chạy tiếp)."
-                  ).pack(anchor="w", pady=(0, 4))
-        row = ttk.Frame(fi)
-        row.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(row, columns=("n", "img", "note"), show="headings", height=4)
-        for c, t, w in (("n", "#", 40), ("img", "Ảnh mẫu", 260), ("note", "Ghi chú", 360)):
-            self.tree.heading(c, text=t)
-            self.tree.column(c, width=w, anchor="w")
-        self.tree.pack(side="left", fill="both", expand=True)
-        self.tree.tag_configure("even", background="white")
-        self.tree.tag_configure("odd", background="#f5f3ff")
-        self.tree.tag_configure("final", background="#dcfce7", foreground="#166534")
-        bf = ttk.Frame(row)
-        bf.pack(side="left", fill="y", padx=(6, 0))
+        hint = ttk.Frame(fi)
+        hint.pack(fill="x", pady=(0, 4))
+        ttk.Label(hint, foreground="#4338ca", justify="left", wraplength=560,
+                  text="Mỗi 'Chu kỳ quét' giây: chụp màn hình, thấy ảnh nào thì làm 'Hành động' của ảnh đó. "
+                       "Làm xong ảnh CUỐI CÙNG thì tab tắt. Đổi hành động: bấm đúp vào dòng ảnh."
+                  ).pack(side="left", anchor="w")
+        ttk.Checkbutton(hint, text="Xong Mục 1 thì tự chạy lại từ đầu\nvới Mục 2 (xem quảng cáo)",
+                        variable=var("chain_qc", "b")).pack(side="right")
+        body = ttk.Frame(fi)
+        body.pack(fill="both", expand=True)
+        self.lists_nb = ttk.Notebook(body)
+        self.lists_nb.pack(side="left", fill="both", expand=True)
+        self.trees = {}
+        for k, title in ((1, "  Mục 1: Danh sách chính  "), (2, "  Mục 2: 📺 Xem quảng cáo  ")):
+            pg = ttk.Frame(self.lists_nb, padding=(0, 4, 0, 0))
+            self.lists_nb.add(pg, text=title)
+            tr = ttk.Treeview(pg, columns=("n", "img", "act", "note"), show="headings", height=4)
+            for c, t, w in (("n", "#", 32), ("img", "Ảnh mẫu", 150), ("act", "Hành động", 330), ("note", "Ghi chú", 130)):
+                tr.heading(c, text=t)
+                tr.column(c, width=w, minwidth=30, anchor="w", stretch=(c == "act"))
+            tr.pack(side="left", fill="both", expand=True)
+            tr.tag_configure("even", background="white")
+            tr.tag_configure("odd", background="#f5f3ff")
+            tr.tag_configure("final", background="#dcfce7", foreground="#166534")
+            tr.tag_configure("pack", background="#ffedd5", foreground="#9a3412")
+            tr.bind("<Double-1>", lambda e: self.edit_action())
+            self.trees[k] = tr
+        self.tree = self.trees[1]
+        self.lists_nb.bind("<<NotebookTabChanged>>",
+                           lambda e: self.select_list(self.lists_nb.index("current") + 1, switch_tab=False))
+        bf = ttk.Frame(body)
+        bf.pack(side="left", fill="y", padx=(6, 0), pady=(24, 0))
         for text, cmd, r, c in (("Chụp ảnh mới", self.capture_new, 0, 0), ("Chọn ảnh có sẵn", self.add_existing, 0, 1),
                                 ("▲ Lên", lambda: self.move_step(-1), 1, 0), ("▼ Xuống", lambda: self.move_step(1), 1, 1),
-                                ("Xóa", self.del_step, 2, 0)):
+                                ("Xóa", self.del_step, 2, 0), ("Hành động...", self.edit_action, 2, 1)):
             ttk.Button(bf, text=text, command=cmd, width=15,
                        style="Accent.TButton" if text == "Chụp ảnh mới" else "TButton").grid(
                 row=r, column=c, padx=2, pady=2, sticky="ew")
+        ttk.Button(bf, text="➕ Bước không ảnh (ra rồi vào lại game)",
+                   command=self.add_noimg).grid(row=3, column=0, columnspan=2, padx=2, pady=2, sticky="ew")
+        ttk.Button(bf, text="📦 Gộp gói...", command=self.make_pack, width=15).grid(
+            row=4, column=0, padx=2, pady=2, sticky="ew")
+        ttk.Button(bf, text="Bỏ gói", command=self.unpack, width=15).grid(row=4, column=1, padx=2, pady=2, sticky="ew")
 
         fs = ttk.LabelFrame(p2, text=" Cài đặt (đơn vị: giây) ", padding=6)
         fs.pack(fill="x", padx=4, pady=4)
@@ -974,6 +1356,7 @@ class App(tk.Tk):
         sp("Timeout mỗi tab (giây, 0 = không bao giờ tự tắt):", "tab_timeout", "i", 0, 86400, 2, 0, 60)
         sp("Quét N lần không thấy ảnh nào thì mở lại tab (0 = tắt):", "stuck_scans", "i", 0, 1000, 3, 0, 1)
         sp("Mở lại tối đa (lần/tab):", "stuck_max_restarts", "i", 1, 50, 3, 1, 1)
+        sp("Mỗi ảnh bấm tối đa (lần) không ăn thì sang ảnh tiếp theo:", "max_tries", "i", 1, 20, 4, 0, 1)
 
         fa = ttk.LabelFrame(p2, text=" Nâng cao ", padding=6)
         fa.pack(fill="x", padx=4, pady=4)
@@ -1007,17 +1390,20 @@ class App(tk.Tk):
 
         # ================= Điều khiển + log =================
         f5 = ttk.Frame(self)
-        self.btn_start = ttk.Button(f5, text="▶ BẮT ĐẦU", command=self.start, width=14, style="Start.TButton")
+        self.btn_start = ttk.Button(f5, text="▶ BẮT ĐẦU", command=self.start, width=12, style="Start.TButton")
         self.btn_start.pack(side="left")
-        self.btn_pause = ttk.Button(f5, text="Tạm dừng", command=self.toggle_pause, width=12, state="disabled", style="Pause.TButton")
+        self.btn_qc = ttk.Button(f5, text="📺 Xem quảng cáo", command=lambda: self.start(job="qc"), width=18,
+                                 style="Accent.TButton")
+        self.btn_qc.pack(side="left", padx=(6, 0))
+        self.btn_pause = ttk.Button(f5, text="Tạm dừng", command=self.toggle_pause, width=10, state="disabled", style="Pause.TButton")
         self.btn_pause.pack(side="left", padx=6)
-        self.btn_stop = ttk.Button(f5, text="■ Dừng", command=self.stop, width=10, state="disabled", style="Stop.TButton")
+        self.btn_stop = ttk.Button(f5, text="■ Dừng", command=self.stop, width=8, state="disabled", style="Stop.TButton")
         self.btn_stop.pack(side="left")
-        self.btn_skip = ttk.Button(f5, text="⏭ Bỏ qua đợt này", command=self.skip_batch, width=18, state="disabled", style="Skip.TButton")
+        self.btn_skip = ttk.Button(f5, text="⏭ Bỏ qua đợt", command=self.skip_batch, width=13, state="disabled", style="Skip.TButton")
         self.btn_skip.pack(side="left", padx=6)
         self.lbl_prog = ttk.Label(f5, text="Chưa chạy")
-        self.lbl_prog.pack(side="left", padx=12)
-        self.pb = ttk.Progressbar(f5, length=240)
+        self.lbl_prog.pack(side="left", padx=8)
+        self.pb = ttk.Progressbar(f5, length=110)
         self.pb.pack(side="left")
         ttk.Button(f5, text="💾 Lưu cài đặt", command=self.save_settings, width=14,
                    style="Accent.TButton").pack(side="right")
@@ -1158,25 +1544,43 @@ class App(tk.Tk):
             self.vars["ld_dir"].set(d)
             self.scan()
 
-    # ---- danh sách ảnh cần click
+    # ---- danh sách ảnh cần click (2 danh sách: Mục 1 & Mục 2 xem quảng cáo)
+    def select_list(self, k, switch_tab=True):
+        """Chọn danh sách đang làm việc ở Bước 2 (các nút Chụp ảnh/Xóa/Lên/Xuống tác động lên danh sách này)."""
+        self.cur = k
+        self.steps = self.lists[k]
+        self.tree = self.trees[k]
+        if switch_tab and self.lists_nb.index("current") != k - 1:
+            self.lists_nb.select(k - 1)
+
     def refresh_tree(self, select=None):
         self.tree.delete(*self.tree.get_children())
         n_total = len(self.steps)
+        pack_note = {}
+        for k, (a, b, t) in enumerate(find_packs(self.steps), 1):
+            for n in range(a, b + 1):
+                pack_note[n] = f"📦 Gói {k}: lặp {t} lần" if n == a else f"📦 Gói {k}"
         for n, st in enumerate(self.steps, 1):
-            note = "ẢNH CUỐI: click được là tắt tab" if n == n_total else "click rồi sang ảnh kế tiếp"
-            tag = "final" if n == n_total else ("odd" if n % 2 else "even")
-            self.tree.insert("", "end", iid=str(n - 1), tags=(tag,), values=(n, st["image"], note))
+            note = "ẢNH CUỐI → tắt tab" if n == n_total else pack_note.get(n, "")
+            tag = "final" if n == n_total else "pack" if n in pack_note else ("odd" if n % 2 else "even")
+            if n == n_total and is_noimg(st):
+                note = "BƯỚC CUỐI → tắt tab"
+            img = "(không ảnh)" if is_noimg(st) else st["image"]
+            self.tree.insert("", "end", iid=str(n - 1), tags=(tag,), values=(n, img, action_text(st), note))
         if select is not None and 0 <= select < len(self.steps):
             self.tree.selection_set(str(select))
-        save_json(WORKFLOW_FILE, self.steps)
+        save_json(LIST_FILES[self.cur], self.steps)
 
     def selected(self):
         sel = self.tree.selection()
         return int(sel[0]) if sel else None
 
     def capture_new(self):
+        k = self.cur   # thêm vào đúng danh sách lúc bấm nút, kể cả khi đổi thẻ trong lúc chụp
+
         def cb(kind, data):
             if kind == "template":
+                self.select_list(k)
                 self.steps.append({"image": data})
                 self.refresh_tree(len(self.steps) - 1)
         self.open_picker(cb)
@@ -1192,6 +1596,216 @@ class App(tk.Tk):
             shutil.copy2(f, dest)
         self.steps.append({"image": name})
         self.refresh_tree(len(self.steps) - 1)
+
+    def selected_range(self):
+        """Các dòng đang chọn (giữ Ctrl/Shift để chọn nhiều) -> (đầu, cuối) theo chỉ số 0, hoặc None."""
+        sel = [int(x) for x in self.tree.selection()]
+        return (min(sel), max(sel)) if sel else None
+
+    def make_pack(self):
+        """Gộp các dòng liền nhau đang chọn thành 1 gói, lặp N lần."""
+        rg = self.selected_range()
+        if rg is None:
+            messagebox.showinfo("Gộp gói", "Chọn các dòng muốn gộp: bấm dòng đầu, giữ Shift rồi bấm dòng cuối.")
+            return
+        lo, hi = rg
+        if hi >= len(self.steps) - 1:
+            messagebox.showerror("Gộp gói", "Dòng CUỐI danh sách (bước kết thúc, xong thì tắt tab) "
+                                            "không được nằm trong gói.\nHãy chọn các dòng phía trên nó.")
+            return
+        if all(is_noimg(st) for st in self.steps[lo:hi + 1]):
+            messagebox.showerror("Gộp gói", "Gói cần có ít nhất 1 dòng có ảnh.")
+            return
+        old = self.steps[lo]
+        times = tk.IntVar(value=int(old.get("pack_times", 50)))
+        win = tk.Toplevel(self)
+        win.title("Gộp thành gói")
+        win.configure(bg=PAL["bg"])
+        win.transient(self)
+        win.resizable(False, False)
+        ttk.Label(win, text=f"Gộp #{lo + 1} đến #{hi + 1} ({hi - lo + 1} dòng) thành 1 gói",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=14, pady=(12, 6))
+        f = ttk.Frame(win)
+        f.pack(anchor="w", padx=24, pady=(0, 6))
+        ttk.Label(f, text="Chạy cả gói bao nhiêu lần:").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Spinbox(f, from_=1, to=1000, increment=1, textvariable=times, width=6).grid(
+            row=0, column=1, sticky="w", padx=4)
+        ttk.Label(win, foreground="#666", wraplength=380, justify="left",
+                  text="Khi thấy ảnh đầu tiên của gói, bot làm LIÊN TỤC từng dòng trong gói từ trên xuống, "
+                       "KHÔNG BỎ BƯỚC: ảnh nào chưa hiện thì chờ tới khi hiện (vd hết quảng cáo thì chờ có lại). "
+                       "Lặp đủ số lần rồi mới làm các dòng sau gói."
+                  ).pack(anchor="w", padx=14, pady=(0, 8))
+
+        def ok():
+            try:
+                t = max(1, int(times.get()))
+            except (tk.TclError, ValueError):
+                messagebox.showerror("Gộp gói", "Số lần chưa đúng.", parent=win)
+                return
+            pid = max([int(s.get("pack", 0)) for s in self.steps] + [0]) + 1
+            for st in self.steps[lo:hi + 1]:
+                st.pop("pack_wait", None)
+                st.update(pack=pid, pack_times=t)
+            win.destroy()
+            self.refresh_tree(lo)
+
+        bf = ttk.Frame(win)
+        bf.pack(fill="x", padx=14, pady=(0, 12))
+        ttk.Button(bf, text="Hủy", command=win.destroy).pack(side="right")
+        ttk.Button(bf, text="OK", command=ok, style="Accent.TButton").pack(side="right", padx=6)
+        win.grab_set()
+
+    def unpack(self):
+        """Bỏ gói chứa các dòng đang chọn (các dòng vẫn giữ nguyên trong danh sách)."""
+        rg = self.selected_range()
+        pids = {self.steps[n].get("pack") for n in range(rg[0], rg[1] + 1)} - {None} if rg else set()
+        if not pids:
+            messagebox.showinfo("Bỏ gói", "Hãy chọn 1 dòng nằm trong gói (dòng màu cam).")
+            return
+        for st in self.steps:
+            if st.get("pack") in pids:
+                for k in PACK_KEYS:
+                    st.pop(k, None)
+        self.refresh_tree(rg[0])
+
+    def add_noimg(self):
+        """Chèn 1 bước không ảnh ngay dưới dòng đang chọn (chưa chọn thì thêm cuối danh sách)."""
+        if self.cur != 2:
+            messagebox.showinfo("Bước không ảnh", "Bước ra màn hình chính rồi vào lại game chỉ dùng ở "
+                                                  "Mục 2 (Xem quảng cáo).")
+            return
+        idx = self.selected()
+        pos = len(self.steps) if idx is None else idx + 1
+        step = dict({"action": NOIMG}, **dict(NOIMG_WAITS))
+        if idx is not None and pos < len(self.steps):
+            copy_pack(self.steps[idx], step)   # chèn ngay dưới 1 dòng trong gói -> cũng thuộc gói đó
+        self.steps.insert(pos, step)
+        self.refresh_tree(pos)
+        self.edit_noimg(pos)
+
+    def edit_noimg(self, idx):
+        """Cửa sổ chỉnh 2 khoảng chờ của bước không ảnh."""
+        st = self.steps[idx]
+        win = tk.Toplevel(self)
+        win.title("Bước không ảnh")
+        win.configure(bg=PAL["bg"])
+        win.transient(self)
+        win.resizable(False, False)
+        ttk.Label(win, text=f"#{idx + 1}: chạy ngay sau khi làm bước #{idx}" if idx else
+                  "#1: chạy mỗi lần bắt đầu lượt", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=14, pady=(12, 6))
+        vs = {}
+        f = ttk.Frame(win)
+        f.pack(anchor="w", padx=24, pady=(0, 6))
+        for r, ((k, d), text) in enumerate(zip(NOIMG_WAITS, ("Chờ (giây) rồi ra màn hình chính:",
+                                                             "Ở màn hình chính chờ (giây) rồi vào lại game:"))):
+            vs[k] = tk.DoubleVar(value=float(st.get(k, d)))
+            ttk.Label(f, text=text).grid(row=r, column=0, sticky="w", pady=2)
+            ttk.Spinbox(f, from_=0, to=3600, increment=0.5, textvariable=vs[k], width=6).grid(
+                row=r, column=1, sticky="w", padx=4)
+        ttk.Label(win, foreground="#666", wraplength=360, justify="left",
+                  text="Dùng khi bấm xem quảng cáo xong không thoát ra được: bot về màn hình chính "
+                       "rồi mở lại đúng game, sau đó làm ảnh tiếp theo.").pack(anchor="w", padx=14, pady=(0, 8))
+
+        def ok():
+            for k, d in NOIMG_WAITS:
+                try:
+                    st[k] = max(0.0, float(vs[k].get()))
+                except (tk.TclError, ValueError):
+                    st[k] = d
+            win.destroy()
+            self.refresh_tree(idx)
+
+        bf = ttk.Frame(win)
+        bf.pack(fill="x", padx=14, pady=(0, 12))
+        ttk.Button(bf, text="Hủy", command=win.destroy).pack(side="right")
+        ttk.Button(bf, text="OK", command=ok, style="Accent.TButton").pack(side="right", padx=6)
+        win.grab_set()
+
+    def edit_action(self):
+        """Cửa sổ nhỏ chọn hành động cho ảnh đang chọn."""
+        idx = self.selected()
+        if idx is None:
+            messagebox.showinfo("Hành động", "Hãy chọn 1 ảnh trong danh sách trước.")
+            return
+        st = self.steps[idx]
+        if is_noimg(st):
+            self.edit_noimg(idx)
+            return
+        win = tk.Toplevel(self)
+        win.title("Hành động khi thấy ảnh")
+        win.configure(bg=PAL["bg"])
+        win.transient(self)
+        win.resizable(False, False)
+        ttk.Label(win, text=f"Khi thấy ảnh '{st['image']}' thì:", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=14, pady=(12, 6))
+        v = tk.StringVar(value=st.get("action", "click"))
+        a0 = v.get()
+        wait = tk.DoubleVar(value=float(st.get("wait", 5)))
+        cwait = tk.DoubleVar(value=float(st.get("click_wait", 1 if a0 == "click_hide_reopen" else 3)))
+        bwait = tk.DoubleVar(value=float(st.get("back_wait", 3)))
+        gwait = tk.DoubleVar(value=float(st.get("game_wait", 3)))
+        # Mục 1 không dùng ẩn/mở lại app; chỉ Mục 2 (xem quảng cáo) mới có
+        acts = ACTIONS if self.cur == 2 else [x for x in ACTIONS if x[0] not in WAIT_ACTIONS]
+        if a0 not in dict(acts):
+            v.set("click")
+        for key, label in acts:
+            ttk.Radiobutton(win, text=label, value=key, variable=v).pack(anchor="w", padx=24, pady=1)
+        wf = ttk.Frame(win)
+        wf.pack(anchor="w", padx=42, pady=(2, 6))
+        rows = [("cw", "Sau khi click, chờ (giây):", cwait, 0.5),
+                ("bw", "Bấm Back xong, chờ (giây):", bwait, 0.5),
+                ("gw", "Vào lại game xong, chờ (giây):", gwait, 0.5)]
+        if self.cur == 2:
+            rows.insert(1, ("w", "Ẩn app, chờ (giây) rồi mở lại:", wait, 1))
+        spins = {}
+        for r, (key, text, var_, inc) in enumerate(rows):
+            ttk.Label(wf, text=text).grid(row=r, column=0, sticky="w", pady=1)
+            spins[key] = ttk.Spinbox(wf, from_=0, to=3600, increment=inc, textvariable=var_, width=6)
+            spins[key].grid(row=r, column=1, sticky="w", padx=4)
+        # ô nào dùng cho hành động nào
+        uses = {"cw": ("click_hide_reopen", "back"), "w": WAIT_ACTIONS, "bw": ("back",), "gw": ("back",)}
+
+        def sync(*_):
+            a = v.get()
+            for k2, sp_ in spins.items():
+                sp_.config(state="normal" if a in uses[k2] else "disabled")
+        v.trace_add("write", sync)
+        sync()
+        ttk.Label(win, foreground="#666", wraplength=380, justify="left",
+                  text="Vuốt: cuộn giữa màn hình. Back: click ảnh, chờ, bấm nút Back của Android, chờ, "
+                       "nếu đã ra khỏi game thì tự vào lại game, chờ rồi làm ảnh tiếp theo."
+                       + ("" if self.cur == 1 else
+                          "\nẨn app: về màn hình chính, chờ, rồi mở lại đúng game đang chạy. "
+                          "Click rồi ẩn app: dùng khi bấm xong hiện quảng cáo.")
+                       + "\nSố lần bấm tối đa mỗi ảnh chỉnh ở Bước 3 (Cài đặt).").pack(
+            anchor="w", padx=14, pady=(0, 8))
+
+        def num(var_, d):
+            try:
+                return max(0.0, float(var_.get()))
+            except (tk.TclError, ValueError):
+                return d
+
+        def ok():
+            a = v.get()
+            for k2 in ("action", "wait", "click_wait", "tries", "back_wait", "game_wait"):
+                st.pop(k2, None)
+            if a != "click":
+                st["action"] = a
+            if a in WAIT_ACTIONS:
+                st["wait"] = num(wait, 5.0)
+            if a == "click_hide_reopen":
+                st["click_wait"] = num(cwait, 1.0)
+            if a == "back":
+                st["click_wait"], st["back_wait"], st["game_wait"] = num(cwait, 3.0), num(bwait, 3.0), num(gwait, 3.0)
+            win.destroy()
+            self.refresh_tree(idx)
+
+        bf = ttk.Frame(win)
+        bf.pack(fill="x", padx=14, pady=(0, 12))
+        ttk.Button(bf, text="Hủy", command=win.destroy).pack(side="right")
+        ttk.Button(bf, text="OK", command=ok, style="Accent.TButton").pack(side="right", padx=6)
+        win.grab_set()
 
     def del_step(self):
         idx = self.selected()
@@ -1255,6 +1869,7 @@ class App(tk.Tk):
 
     def set_running(self, running):
         self.btn_start.config(state="disabled" if running else "normal")
+        self.btn_qc.config(state="disabled" if running else "normal")
         self.btn_try.config(state="disabled" if running else "normal")
         self.btn_pause.config(state="normal" if running else "disabled", text="Tạm dừng")
         self.btn_stop.config(state="normal" if running else "disabled")
@@ -1273,9 +1888,11 @@ class App(tk.Tk):
         cfg["tab_timeout"] = max(0, int(cfg["tab_timeout"]))
         cfg["stuck_scans"] = max(0, int(cfg["stuck_scans"]))
         cfg["stuck_max_restarts"] = max(1, int(cfg["stuck_max_restarts"]))
+        cfg["max_tries"] = min(20, max(1, int(cfg["max_tries"])))
         cfg["daily_hour"] = min(23, max(0, int(cfg["daily_hour"])))
         cfg["daily_minute"] = min(59, max(0, int(cfg["daily_minute"])))
-        for k in ("batch_size", "step_interval", "match_percent", "tab_timeout", "daily_hour", "daily_minute"):
+        for k in ("batch_size", "step_interval", "match_percent", "tab_timeout", "max_tries",
+                  "daily_hour", "daily_minute"):
             self.vars[k].set(cfg[k])
         if self.instances:
             cfg["excluded_tabs"] = sorted({i["index"] for i in self.instances} - self.checked)
@@ -1338,8 +1955,11 @@ class App(tk.Tk):
             self.start(auto=True)
 
     # ---- chạy
-    def start(self, only_tab=None, auto=False):
-        """auto=True: chạy theo giờ hẹn, không hiện hộp thoại (không có ai ở máy để bấm), lỗi ghi vào nhật ký."""
+    def start(self, only_tab=None, auto=False, job="main"):
+        """auto=True: chạy theo giờ hẹn, không hiện hộp thoại (không có ai ở máy để bấm), lỗi ghi vào nhật ký.
+        job="main": chạy Mục 1 (rồi Mục 2 nếu tick 'Xong Mục 1 thì tự chạy lại từ đầu với Mục 2').
+        job="qc":   chỉ chạy Mục 2 (xem quảng cáo) từ đầu.
+        only_tab:   chạy thử 1 tab với danh sách đang hiện ở Bước 2."""
         if self.thread and self.thread.is_alive():
             return
 
@@ -1369,13 +1989,26 @@ class App(tk.Tk):
             err(f"Không có tab nào để chạy. Kiểm tra các tab đã tick ở Bước 1 "
                 f"và ô 'Chạy từ tab số' (đang là {sf}).")
             return
-        if not self.steps:
-            err("Danh sách ảnh đang trống. Hãy thêm ít nhất 1 ảnh (ảnh cuối cùng là ảnh kết thúc).")
-            return
-        for st in self.steps:
-            if not os.path.isfile(os.path.join(TEMPLATE_DIR, st["image"])):
-                err(f"Thiếu ảnh mẫu: {st['image']}\n(trong thư mục templates)")
+        # các danh sách sẽ chạy, theo thứ tự
+        if only_tab:
+            keys = [self.cur]
+        elif job == "qc":
+            keys = [2]
+        else:
+            keys = [1]
+            if cfg.get("chain_qc"):
+                if self.lists[2]:
+                    keys.append(2)
+                else:
+                    self.log("Lưu ý: đã tick tự chạy Mục 2 nhưng danh sách Mục 2 (xem quảng cáo) đang trống, bỏ qua Mục 2")
+        for k in keys:
+            if not self.lists[k]:
+                err(f"Danh sách {LIST_NAMES[k]} đang trống. Hãy thêm ít nhất 1 ảnh (ảnh cuối cùng là ảnh kết thúc).")
                 return
+            for st in self.lists[k]:
+                if not is_noimg(st) and not os.path.isfile(os.path.join(TEMPLATE_DIR, st["image"])):
+                    err(f"Thiếu ảnh mẫu: {st['image']} ({LIST_NAMES[k]})\n(trong thư mục templates)")
+                    return
         if not only_tab and not auto:
             try:
                 busy = [i["index"] + 1 for i in self.get_ld().list_instances()
@@ -1401,12 +2034,26 @@ class App(tk.Tk):
         self.skip_ev.clear()
         self.pb["value"] = 0
         self.set_running(True)
-        self.thread = threading.Thread(target=self._worker, args=(run_cfg, list(self.steps)), daemon=True)
+        jobs = [(k, [dict(st) for st in self.lists[k]]) for k in keys]
+        self.thread = threading.Thread(target=self._worker, args=(run_cfg, jobs), daemon=True)
         self.thread.start()
 
-    def _worker(self, cfg, steps):
+    def _worker(self, cfg, jobs):
         try:
-            Runner(cfg, steps, self.log, self.progress, self.stop_ev, self.pause_ev, self.skip_ev).run()
+            for n, (k, steps) in enumerate(jobs):
+                if self.stop_ev.is_set():
+                    break
+                if n > 0:
+                    self.log(f"=== XONG MỤC TRƯỚC -> CHẠY LẠI TỪ ĐẦU VỚI {LIST_NAMES[k]} ===")
+                    time.sleep(float(cfg.get("post_batch_wait", 3)))
+                    if self.stop_ev.is_set():
+                        break
+                if len(jobs) > 1 or k == 2:
+                    self.log(f"=== {LIST_NAMES[k]}: {len(steps)} ảnh ===")
+                short = "Mục 1" if k == 1 else "Quảng cáo"
+                prog = (lambda s: (lambda v, mx, t: self.progress(v, mx, f"{s}: {t}")))(short)
+                self.skip_ev.clear()
+                Runner(cfg, steps, self.log, prog, self.stop_ev, self.pause_ev, self.skip_ev).run()
         except Exception:
             self.log("LỖI nghiêm trọng:\n" + traceback.format_exc())
         finally:
